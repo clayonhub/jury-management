@@ -1,0 +1,6 @@
+streamlit==1.42.0
+numpy==1.26.4
+langchain==1.2.10
+langchain-huggingface==1.2.0
+sentence-transformers==3.4.1
+torch==2.6.0

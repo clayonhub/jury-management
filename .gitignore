@@ -1,0 +1,16 @@
+# Environments
+.env
+.env.local
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Data
+data.json
