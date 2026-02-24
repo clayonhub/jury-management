@@ -5,10 +5,7 @@ import numpy as np
 import math
 import re
 import json
-from dotenv import load_dotenv
-
-# Load environment variables from .env.local if present, overriding terminal vars
-load_dotenv(".env.local", override=True)
+# No external APIs are used, so no dotenv is needed.
 
 DATA_FILE = "data.json"
 
