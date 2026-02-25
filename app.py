@@ -1,10 +1,11 @@
 import streamlit as st
 import os
-import requests
 import numpy as np
 import math
 import re
 import json
+import io
+import pandas as pd
 # No external APIs are used, so no dotenv is needed.
 
 DATA_FILE = "data.json"
@@ -273,13 +274,66 @@ if st.button("Run Matching", type="primary"):
     st.header("🌟 Overall Jury Ranking")
     num_projects = len(st.session_state.projects)
     avg_scores = [
-        (name, total / num_projects if num_projects > 0 else 0.0) 
+        (name, total / num_projects if num_projects > 0 else 0.0)
         for name, total in jury_total_scores.items()
     ]
     avg_scores.sort(key=lambda x: x[1], reverse=True)
     
     for idx, (name, avg) in enumerate(avg_scores[:5]):
         st.markdown(f"**{idx+1}. {name}** — Avg Score: {avg:.3f}")
+
+    # ==========================================
+    # EXPORT RESULTS
+    # ==========================================
+    st.divider()
+    st.header("📥 Export Results")
+
+    # Build a lookup: {jury_name: {project_title: final_score}}
+    score_lookup = {}
+    for pr in project_results:
+        proj_title = pr["project"]
+        for r in pr["rankings"]:
+            score_lookup.setdefault(r["name"], {})[proj_title] = r["final_score"]
+
+    # Project column names (in order)
+    project_titles = [pr["project"] for pr in project_results]
+
+    # Build rows: one per jury, sorted by overall rank
+    export_rows = []
+    for rank_idx, (jury_name, avg_score) in enumerate(avg_scores, start=1):
+        row = {
+            "Rank": rank_idx,
+            "Jury Name": jury_name,
+        }
+        for pt in project_titles:
+            row[pt] = round(score_lookup.get(jury_name, {}).get(pt, 0.0), 4)
+        row["Overall Avg Score"] = round(avg_score, 4)
+        export_rows.append(row)
+
+    export_df = pd.DataFrame(export_rows)
+
+    st.dataframe(export_df, use_container_width=True)
+
+    # --- Excel Download ---
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name="Jury Results")
+    excel_buffer.seek(0)
+    st.download_button(
+        label="⬇️ Download as Excel (.xlsx)",
+        data=excel_buffer,
+        file_name="jury_matching_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # --- CSV Download ---
+    csv_data = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download as CSV (.csv)",
+        data=csv_data,
+        file_name="jury_matching_results.csv",
+        mime="text/csv",
+    )
 
 # ==========================================
 # DEPLOYMENT INSTRUCTIONS
