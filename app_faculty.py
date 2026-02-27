@@ -147,7 +147,7 @@ with st.expander("🔍 Filter Faculty", expanded=True):
         mask &= (
             faculty_df["department"].str.contains(q_area.strip(), case=False, na=False) |
             faculty_df["research_area"].str.contains(q_area.strip(), case=False, na=False) |
-            faculty_df["research_area_detail"].str.contains(q_area.strip(), case=False, na=False)
+            faculty_df["research_area_details"].str.contains(q_area.strip(), case=False, na=False)
         )
 
     filtered_df = faculty_df[mask].copy()
