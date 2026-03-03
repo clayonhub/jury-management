@@ -58,8 +58,14 @@ for i in range(0, len(texts), BATCH_SIZE):
         print(f"  Processed {min(i + BATCH_SIZE, len(texts))} / {len(texts)}")
 
 emb_array = np.array(all_embeddings, dtype=np.float32)
+
+# L2-normalise now so the deployed app can use fast dot products (no per-query norm)
+norms = np.linalg.norm(emb_array, axis=1, keepdims=True)
+norms = np.where(norms == 0, 1.0, norms)
+emb_array = emb_array / norms
+
 np.save(EMB_PATH, emb_array)
-print(f"Saved embeddings → {EMB_PATH}  shape={emb_array.shape}")
+print(f"Saved normalised embeddings → {EMB_PATH}  shape={emb_array.shape}")
 
 # Save the index (name + college per row, same order as array)
 index = df[["name", "college"]].to_dict(orient="records")

@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import json
 import io
-import math
 import numpy as np
 import pandas as pd
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -15,6 +14,7 @@ EMB_PATH   = "faculty_embeddings.npy"
 INDEX_PATH = "faculty_embeddings_index.json"
 MODEL_NAME = "all-MiniLM-L6-v2"
 BATCH_SIZE = 128
+TOP_K      = 5          # top results to keep per project
 
 # ==========================================
 # APP CONFIGURATION
@@ -35,12 +35,25 @@ def get_hf_model():
 @st.cache_data(show_spinner="Loading faculty database…")
 def load_faculty_df():
     df = pd.read_csv(CSV_PATH)
-    USED_COLS = ["name", "college", "department", "research_area", "research_area_details"]
+    # Include all columns we display or use for filtering/matching
+    USED_COLS = ["url", "name", "designation", "college", "department",
+                 "research_area", "research_area_details"]
+    # Only keep columns that actually exist in the CSV
+    USED_COLS = [c for c in USED_COLS if c in df.columns]
     df = df[USED_COLS].copy()
     df = df.dropna(subset=["name"])
     df = df.fillna("")
     df = df.reset_index(drop=True)
     return df
+
+@st.cache_data(show_spinner=False)
+def get_designation_options(df: pd.DataFrame):
+    """Sorted unique designation values for the dropdown filter."""
+    if "designation" not in df.columns:
+        return []
+    vals = df["designation"].dropna().unique().tolist()
+    vals = sorted([v for v in vals if str(v).strip()])
+    return vals
 
 def build_faculty_text(row):
     parts = [
@@ -54,46 +67,67 @@ def build_faculty_text(row):
 def load_faculty_embeddings(n_rows: int):
     """
     Load pre-computed embeddings from disk if available.
-    Falls back to computing on-the-fly (first run on cloud or missing file).
+    Returns L2-normalised float32 matrix so cosine similarity == dot product.
+    Falls back to computing on-the-fly when files are missing.
     n_rows is passed so the cache key is tied to the dataset size.
     """
     if os.path.exists(EMB_PATH) and os.path.exists(INDEX_PATH):
-        emb_array = np.load(EMB_PATH)
+        emb_array = np.load(EMB_PATH).astype(np.float32)
         with open(INDEX_PATH, "r", encoding="utf-8") as f:
             index = json.load(f)
-        return emb_array, index
-    # Fallback: compute embeddings now
-    model = get_hf_model()
-    df = load_faculty_df()
-    texts = df.apply(build_faculty_text, axis=1).tolist()
-    all_embs = []
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        all_embs.extend(model.embed_documents(batch))
-    emb_array = np.array(all_embs, dtype=np.float32)
-    np.save(EMB_PATH, emb_array)
-    index = df[["name", "college"]].to_dict(orient="records")
-    with open(INDEX_PATH, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False)
+    else:
+        # Fallback: compute embeddings now (slow – run precompute_embeddings.py instead)
+        model = get_hf_model()
+        df    = load_faculty_df()
+        texts = df.apply(build_faculty_text, axis=1).tolist()
+        all_embs = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i : i + BATCH_SIZE]
+            all_embs.extend(model.embed_documents(batch))
+        emb_array = np.array(all_embs, dtype=np.float32)
+        np.save(EMB_PATH, emb_array)
+        index = df[["name", "college"]].to_dict(orient="records")
+        with open(INDEX_PATH, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False)
+
+    # L2-normalise once so dot product == cosine similarity at query time
+    norms = np.linalg.norm(emb_array, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)   # avoid div-by-zero
+    emb_array = emb_array / norms
     return emb_array, index
 
 # ==========================================
 # HELPERS
 # ==========================================
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
 def get_project_embedding(text: str) -> np.ndarray:
+    """Embed a project text, L2-normalised, with session-level caching."""
     if not text.strip():
         return np.zeros(384, dtype=np.float32)
     cache = st.session_state.setdefault("proj_emb_cache", {})
     if text not in cache:
         model = get_hf_model()
-        cache[text] = np.array(model.embed_query(text), dtype=np.float32)
+        vec = np.array(model.embed_query(text), dtype=np.float32)
+        n   = np.linalg.norm(vec)
+        if n > 0:
+            vec /= n
+        cache[text] = vec
     return cache[text]
+
+
+def top_k_scores(emb_matrix: np.ndarray, query_vec: np.ndarray, k: int):
+    """
+    Vectorised top-k cosine similarity.
+    emb_matrix : (N, D) normalised float32
+    query_vec  : (D,)   normalised float32
+    Returns arrays (indices, scores) of the top-k rows, sorted descending.
+    """
+    # One BLAS matrix-vector multiply → (N,) similarities
+    sims = emb_matrix @ query_vec          # shape (N,)
+    k    = min(k, len(sims))
+    # argpartition is O(N) – much faster than a full sort for large N
+    part = np.argpartition(sims, -k)[-k:]
+    part = part[np.argsort(sims[part])[::-1]]   # sort just the k candidates
+    return part, sims[part]
 
 # ==========================================
 # STATE
@@ -129,13 +163,22 @@ st.caption(
 )
 
 with st.expander("🔍 Filter Faculty", expanded=True):
-    fc1, fc2, fc3 = st.columns(3)
+    fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
         q_name = st.text_input("Search by Name", placeholder="e.g. Sharma")
     with fc2:
         q_college = st.text_input("Search by College / Institution", placeholder="e.g. NITT")
     with fc3:
         q_area = st.text_input("Search by Department or Research Area", placeholder="e.g. Machine Learning")
+    with fc4:
+        desig_options = get_designation_options(faculty_df)
+        if desig_options:
+            q_desig = st.selectbox(
+                "Filter by Designation",
+                options=["— All Designations —"] + desig_options,
+            )
+        else:
+            q_desig = "— All Designations —"
 
     # Apply filters
     mask = pd.Series([True] * len(faculty_df))
@@ -149,20 +192,40 @@ with st.expander("🔍 Filter Faculty", expanded=True):
             faculty_df["research_area"].str.contains(q_area.strip(), case=False, na=False) |
             faculty_df["research_area_details"].str.contains(q_area.strip(), case=False, na=False)
         )
+    if q_desig and q_desig != "— All Designations —":
+        mask &= faculty_df["designation"].str.fullmatch(q_desig, na=False)
 
     filtered_df = faculty_df[mask].copy()
     st.caption(f"Showing **{len(filtered_df):,}** results.")
 
     if len(filtered_df) > 0:
-        display_df = filtered_df[["name", "college", "department", "research_area"]].rename(
-            columns={
-                "name": "Name",
-                "college": "College",
-                "department": "Department",
-                "research_area": "Research Areas",
-            }
+        # Build a flexible display DataFrame — include every useful column
+        display_cols_map = {
+            "name":                "Name",
+            "designation":         "Designation",
+            "college":             "College",
+            "department":          "Department",
+            "research_area":       "Research Areas",
+            "research_area_details": "Research Details",
+        }
+        disp_cols = [c for c in display_cols_map if c in filtered_df.columns]
+        display_df = filtered_df[disp_cols].rename(columns=display_cols_map)
+
+        # Add a clickable Profile URL column if available
+        if "url" in filtered_df.columns:
+            display_df["Profile URL"] = filtered_df["url"]
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            height=300,
+            column_config={
+                "Profile URL": st.column_config.LinkColumn(
+                    label="Profile URL",
+                    display_text="Open ↗",
+                ),
+            },
         )
-        st.dataframe(display_df, use_container_width=True, height=300)
 
         sel_col1, sel_col2 = st.columns([2, 1])
         with sel_col1:
@@ -184,16 +247,31 @@ with st.expander("🔍 Filter Faculty", expanded=True):
 
 # Show current pool
 if st.session_state.selected_indices:
-    pool_df = faculty_df.loc[st.session_state.selected_indices, ["name", "college", "department", "research_area"]].rename(
-        columns={
-            "name": "Name",
-            "college": "College",
-            "department": "Department",
-            "research_area": "Research Areas",
-        }
+    pool_cols_map = {
+        "name":        "Name",
+        "designation": "Designation",
+        "college":     "College",
+        "department":  "Department",
+        "research_area": "Research Areas",
+    }
+    pool_src_cols = [c for c in pool_cols_map if c in faculty_df.columns]
+    pool_df = faculty_df.loc[st.session_state.selected_indices, pool_src_cols].rename(
+        columns=pool_cols_map
     )
+    if "url" in faculty_df.columns:
+        pool_df["Profile URL"] = faculty_df.loc[st.session_state.selected_indices, "url"]
     st.subheader(f"Current Match Pool — {len(pool_df)} Faculty")
-    st.dataframe(pool_df, use_container_width=True, height=250)
+    st.dataframe(
+        pool_df,
+        use_container_width=True,
+        height=250,
+        column_config={
+            "Profile URL": st.column_config.LinkColumn(
+                label="Profile URL",
+                display_text="Open ↗",
+            ),
+        },
+    )
 else:
     st.info("Match pool is empty. Use the filters above to add faculty.")
 
@@ -247,14 +325,15 @@ if not ready:
 
 if st.button("Run Matching", type="primary", disabled=not ready):
     selected_idx = st.session_state.selected_indices
-    sel_df = faculty_df.loc[selected_idx].copy()
+    sel_df       = faculty_df.loc[selected_idx].reset_index(drop=False)  # keep orig idx in col
 
-    # Build per-faculty text embeddings from pre-computed array
-    faculty_embs = all_embs[selected_idx]  # shape (n_selected, 384)
+    # Slice only the selected rows from the pre-normalised matrix
+    faculty_embs = all_embs[selected_idx]   # shape (n_selected, 384)
 
-    with st.spinner("Computing project embeddings and scoring…"):
+    with st.spinner("Scoring faculty against projects (vectorised)…"):
+        # Track cumulative similarity per faculty name for aggregation
         jury_total_scores = {row["name"]: 0.0 for _, row in sel_df.iterrows()}
-        project_results = []
+        project_results   = []
 
         for p in st.session_state.projects:
             p_text = f"{p['title']} {p['description']}"
@@ -262,23 +341,30 @@ if st.button("Run Matching", type="primary", disabled=not ready):
             if p_emb is None or np.linalg.norm(p_emb) == 0:
                 continue
 
-            scores = []
-            for i, (df_idx, row) in enumerate(sel_df.iterrows()):
-                j_emb = faculty_embs[i]
-                sim   = cosine_similarity(j_emb, p_emb)
-                scores.append({
+            # ⚡ Vectorised: one matrix multiply for all faculty at once
+            top_indices, top_sims = top_k_scores(faculty_embs, p_emb, k=TOP_K)
+
+            rankings = []
+            for local_i, sim in zip(top_indices, top_sims):
+                row = sel_df.iloc[local_i]
+                rankings.append({
                     "name":        row["name"],
+                    "url":         row.get("url", ""),
+                    "designation": row.get("designation", ""),
                     "college":     row["college"],
                     "department":  row["department"],
-                    "similarity":  round(sim, 4),
+                    "similarity":  round(float(sim), 4),
                 })
-                jury_total_scores[row["name"]] += sim
+                jury_total_scores[row["name"]] += float(sim)
 
-            scores.sort(key=lambda x: x["similarity"], reverse=True)
             project_results.append({
                 "project":  p["title"],
-                "rankings": scores,
+                "rankings": rankings,   # already sorted top-K
             })
+
+    # Build a lookup: name → {url, designation} for quick access in results
+    fac_url_lookup = {row["name"]: {"url": row.get("url", ""), "designation": row.get("designation", "")}
+                      for _, row in sel_df.iterrows()}
 
     # ---- RESULTS ----
     st.divider()
@@ -286,26 +372,36 @@ if st.button("Run Matching", type="primary", disabled=not ready):
     for pr in project_results:
         st.subheader(f"Project: {pr['project']}")
         for rank_idx, r in enumerate(pr["rankings"]):
+            url   = r.get("url", "").strip()
+            desig = r.get("designation", "").strip()
+            # Render name as a hyperlink if a URL is available
+            name_md = f"[{r['name']}]({url})" if url else r['name']
+            desig_md = f" · *{desig}*" if desig else ""
             st.markdown(
-                f"**Rank {rank_idx + 1} — {r['name']} — {r['similarity']:.4f}**"
+                f"**#{rank_idx + 1} — {name_md}{desig_md} — {r['similarity']:.4f}**"
             )
             st.caption(
-                f"College: {r['college']} | Department: {r['department']} | "
+                f"College: {r['college']} | Dept: {r['department']} | "
                 f"Cosine Similarity: {r['similarity']:.4f}"
             )
         st.write("")
 
-    # ---- OVERALL RANKING ----
+    # ---- OVERALL RANKING (aggregate across projects) ----
     st.divider()
-    st.header("🌟 Overall Faculty Ranking")
-    num_projects = len(st.session_state.projects)
-    avg_scores   = [
-        (name, total / num_projects)
-        for name, total in jury_total_scores.items()
-    ]
-    avg_scores.sort(key=lambda x: x[1], reverse=True)
-    for rank_idx, (name, avg) in enumerate(avg_scores[:5]):
-        st.markdown(f"**{rank_idx + 1}. {name}** — Avg Similarity: {avg:.4f}")
+    st.header("🌟 Overall Faculty Ranking (Top 5)")
+    num_projects = len(project_results)
+    avg_scores   = sorted(
+        [(name, total / num_projects) for name, total in jury_total_scores.items() if total > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    for rank_idx, (name, avg) in enumerate(avg_scores[:TOP_K]):
+        meta  = fac_url_lookup.get(name, {})
+        url   = meta.get("url", "").strip()
+        desig = meta.get("designation", "").strip()
+        name_md  = f"[{name}]({url})" if url else name
+        desig_md = f" · *{desig}*" if desig else ""
+        st.markdown(f"**{rank_idx + 1}. {name_md}{desig_md}** — Avg Similarity: {avg:.4f}")
 
     # ---- EXPORT ----
     st.divider()
@@ -319,18 +415,23 @@ if st.button("Run Matching", type="primary", disabled=not ready):
 
     project_titles = [pr["project"] for pr in project_results]
 
-    # Faculty metadata lookup
-    fac_meta = sel_df.set_index("name")[["college", "department", "research_area", "research_area_details"]].to_dict(orient="index")
+    # Faculty metadata lookup — include all available fields for the export
+    export_meta_cols = [c for c in ["college", "designation", "department",
+                                     "research_area", "research_area_details", "url"]
+                        if c in sel_df.columns]
+    fac_meta = sel_df.set_index("name")[export_meta_cols].to_dict(orient="index")
 
     export_rows = []
     for rank_idx, (faculty_name, avg_score) in enumerate(avg_scores, start=1):
         meta = fac_meta.get(faculty_name, {})
         row  = {
-            "Rank":           rank_idx,
-            "Faculty Name":   faculty_name,
-            "College":        meta.get("college", ""),
-            "Department":     meta.get("department", ""),
+            "Rank":             rank_idx,
+            "Faculty Name":     faculty_name,
+            "Designation":      meta.get("designation", ""),
+            "College":          meta.get("college", ""),
+            "Department":       meta.get("department", ""),
             "Research Details": meta.get("research_area_details", ""),
+            "Profile URL":      meta.get("url", ""),
         }
         for pt in project_titles:
             row[pt] = score_lookup.get(faculty_name, {}).get(pt, 0.0)
