@@ -136,6 +136,8 @@ if "projects" not in st.session_state:
     st.session_state.projects = []
 if "selected_indices" not in st.session_state:
     st.session_state.selected_indices = []
+if "proj_form_key" not in st.session_state:
+    st.session_state.proj_form_key = 0
 
 # ==========================================
 # LOAD DATA
@@ -282,7 +284,8 @@ st.divider()
 # ==========================================
 st.header("Section 2 — Add Project")
 with st.container():
-    with st.form("add_project_form"):
+    # A unique form key forces Streamlit to re-render blank inputs after each add
+    with st.form(key=f"add_project_form_{st.session_state.proj_form_key}"):
         p_title = st.text_input("Project Title")
         p_desc  = st.text_area("Project Description (~200 words)", height=150)
         submit_proj = st.form_submit_button("Add Project")
@@ -297,7 +300,9 @@ with st.container():
                     "title": p_title.strip(),
                     "description": p_desc.strip(),
                 })
-                st.success(f"Added Project: {p_title}")
+                # Increment key → next render gets a fresh blank form
+                st.session_state.proj_form_key += 1
+                st.rerun()
 
 if st.session_state.projects:
     st.subheader(f"Project List ({len(st.session_state.projects)}/15)")
