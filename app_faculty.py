@@ -416,10 +416,14 @@ if st.button("Run Matching", type="primary", disabled=not ready):
     project_titles = [pr["project"] for pr in project_results]
 
     # Faculty metadata lookup — include all available fields for the export
+    # NOTE: use iterrows instead of set_index().to_dict() to safely handle
+    # duplicate faculty names (set_index raises if the index is not unique).
     export_meta_cols = [c for c in ["college", "designation", "department",
                                      "research_area", "research_area_details", "url"]
                         if c in sel_df.columns]
-    fac_meta = sel_df.set_index("name")[export_meta_cols].to_dict(orient="index")
+    fac_meta = {}
+    for _, row in sel_df[["name"] + export_meta_cols].iterrows():
+        fac_meta[row["name"]] = row[export_meta_cols].to_dict()
 
     export_rows = []
     for rank_idx, (faculty_name, avg_score) in enumerate(avg_scores, start=1):
